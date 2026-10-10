@@ -64,6 +64,13 @@ class Usage(BaseModel):
     output_tokens: int = Field(ge=0)
 
 
+@dataclass(frozen=True)
+class StreamChunk:
+    # 封装上游流式事件：文本增量，或末块携带的 Token 用量。
+    delta: str | None = None
+    usage: Usage | None = None
+
+
 class LLMResponse(BaseModel):
     # 统一模型调用结果，并作为 FastAPI 响应出口的 Pydantic 校验契约。
     model_config = ConfigDict(extra="forbid")
@@ -172,7 +179,7 @@ class Provider(Protocol):
         config: ModelConfig,
         messages: list[Message],
         timeout_seconds: float,
-    ) -> AsyncIterator[str]: ...
+    ) -> AsyncIterator[StreamChunk]: ...
 
 
 class OpenAICompatibleProvider:
@@ -233,18 +240,27 @@ class OpenAICompatibleProvider:
         config: ModelConfig,
         messages: list[Message],
         timeout_seconds: float,
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[StreamChunk]:
         # 逐块读取上游响应，为 Gateway 的实时流式代理提供标准增量文本。
+        # 开启 include_usage 让末块携带真实 Token 用量，供成本审计使用。
         response = await self.create_client(config).chat.completions.create(
             model=config.provider_model,
             messages=[message.model_dump() for message in messages],
             stream=True,
+            stream_options={"include_usage": True},
             timeout=timeout_seconds,
         )
         async for chunk in response:
+            if chunk.usage is not None:
+                yield StreamChunk(
+                    usage=Usage(
+                        input_tokens=chunk.usage.prompt_tokens or 0,
+                        output_tokens=chunk.usage.completion_tokens or 0,
+                    )
+                )
             choice = chunk.choices[0] if chunk.choices else None
             if choice and choice.delta.content:
-                yield choice.delta.content
+                yield StreamChunk(delta=choice.delta.content)
 
 
 provider: Provider = OpenAICompatibleProvider()
@@ -387,13 +403,17 @@ async def stream_with_fallback(request: LLMRequest) -> AsyncIterator[str]:
     emitted = False
     last_error: Exception | None = None
     for model_name in dict.fromkeys([request.model, "general-backup"]):
+        usage = Usage(input_tokens=0, output_tokens=0)
         try:
             config = validate_model(model_name, None)
             attempts += 1
-            async for delta in provider.stream(config, messages, request.timeout_seconds):
-                emitted = True
-                yield encode_sse({"type": "content.delta", "delta": delta})
-            record_trace(str(uuid4()), request.model, model_name, request.prompt, Usage(input_tokens=0, output_tokens=0), int((time.perf_counter() - started) * 1000), attempts, "success")
+            async for chunk in provider.stream(config, messages, request.timeout_seconds):
+                if chunk.delta:
+                    emitted = True
+                    yield encode_sse({"type": "content.delta", "delta": chunk.delta})
+                if chunk.usage is not None:
+                    usage = chunk.usage
+            record_trace(str(uuid4()), request.model, model_name, request.prompt, usage, int((time.perf_counter() - started) * 1000), attempts, "success")
             yield encode_sse({"type": "response.completed", "model": model_name})
             return
         except Exception as exc:
